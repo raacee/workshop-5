@@ -1,50 +1,168 @@
-import bodyParser from "body-parser";
 import express from "express";
-import { BASE_NODE_PORT } from "../config";
-import { Value } from "../types";
+import {BASE_NODE_PORT} from "../config";
+import {NodeState, Value} from "../types";
+import {delay} from "../utils";
 
 export async function node(
-  nodeId: number, // the ID of the node
-  N: number, // total number of nodes in the network
-  F: number, // number of faulty nodes in the network
-  initialValue: Value, // initial value of the node
-  isFaulty: boolean, // true if the node is faulty, false otherwise
-  nodesAreReady: () => boolean, // used to know if all nodes are ready to receive requests
-  setNodeIsReady: (index: number) => void // this should be called when the node is started and ready to receive requests
+  nodeId: number,
+  N: number,
+  F: number,
+  initialValue: Value,
+  isFaulty: boolean,
+  nodesAreReady: () => boolean,
+  setNodeIsReady: (index: number) => void
 ) {
-  const node = express();
-  node.use(express.json());
-  node.use(bodyParser.json());
+  const app = express();
+  app.use(express.json());
 
-  // TODO implement this
+  let state: NodeState = {
+    killed: false,
+    x: isFaulty ? null : initialValue,
+    decided: isFaulty ? null : false,
+    k: isFaulty ? null : 0,
+  };
+
+  let proposals: Map<number, Value[]> = new Map();
+  let votes: Map<number, Value[]> = new Map();
+
   // this route allows retrieving the current status of the node
-  // node.get("/status", (req, res) => {});
+  app.get("/status", (req, res) => {
+    const status = isFaulty ? "faulty" : "live";
+    const statusCode = isFaulty ? 500 : 200;
+    res.status(statusCode).send(status);
+  });
 
-  // TODO implement this
   // this route allows the node to receive messages from other nodes
-  // node.post("/message", (req, res) => {});
+  app.post("/message", async (req, res) => {
+    const {k, x, type} = req.body;
 
-  // TODO implement this
+    if (!isFaulty && !state.killed) {
+      if (type === "proposal") {
+        if (!proposals.has(k)) {
+          proposals.set(k, []);
+        }
+        proposals.get(k)?.push(x);
+        // @ts-ignore
+        if (proposals.get(k).length >= N - F) {
+          const mostCommonValue = getMostCommonValue(proposals.get(k)!);
+          const tieBreaker = mostCommonValue === null ? (Math.random() > 0.5 ? 0 : 1) : mostCommonValue;
+
+          for (let i = 0; i < N; i++) {
+            sendMessage(i, {k, x: tieBreaker, type: "vote"});
+          }
+        }
+      } else if (type === "vote") {
+        if (!votes.has(k)) {
+          votes.set(k, []);
+        }
+        votes.get(k)?.push(x);
+
+        // @ts-ignore
+        if (votes.get(k).length >= N - F) {
+          const voteCounts = getVoteCounts(votes.get(k)!);
+
+          if (voteCounts[0] >= F + 1) {
+            state.x = 0;
+            state.decided = true;
+          } else if (voteCounts[1] >= F + 1) {
+            state.x = 1;
+            state.decided = true;
+          } else {
+            state.x = getMostCommonValue(votes.get(k)!) ?? (Math.random() > 0.5 ? 0 : 1);
+            if(state.k) {
+              state.k++;
+            }
+            else{
+              state.k = 0
+            }
+            for (let i = 0; i < N; i++) {
+              sendMessage(i, {k: state.k, x: state.x, type: "proposal"});
+            }
+          }
+        }
+      }
+    }
+
+    res.status(200).send("Message received and processed.");
+  });
+
   // this route is used to start the consensus algorithm
-  // node.get("/start", async (req, res) => {});
+  app.get("/start", async (req, res) => {
+    while (!nodesAreReady()) {
+      await delay(5);
+    }
 
-  // TODO implement this
+    if (!isFaulty) {
+      state.k = 1;
+      state.x = initialValue;
+      state.decided = false;
+
+      for (let i = 0; i < N; i++) {
+        sendMessage(i, {k: state.k, x: state.x, type: "proposal"});
+      }
+    }
+
+    res.status(200).send("Consensus algorithm started.");
+  });
+
   // this route is used to stop the consensus algorithm
-  // node.get("/stop", async (req, res) => {});
+  app.get("/stop", async (req, res) => {
+    state.killed = true;
+    res.status(200).send("killed");
+  });
 
-  // TODO implement this
   // get the current state of a node
-  // node.get("/getState", (req, res) => {});
+  app.get("/getState", (req, res) => {
+    res.status(200).send({
+      killed: state.killed,
+      x: state.x,
+      decided: state.decided,
+      k: state.k,
+    });
+  });
 
   // start the server
-  const server = node.listen(BASE_NODE_PORT + nodeId, async () => {
+  return app.listen(BASE_NODE_PORT + nodeId, async () => {
     console.log(
       `Node ${nodeId} is listening on port ${BASE_NODE_PORT + nodeId}`
     );
-
-    // the node is ready
     setNodeIsReady(nodeId);
   });
+}
 
-  return server;
+function sendMessage(nodeId: number, message: { k: number; x: Value; type: string }) {
+  fetch(`http://localhost:${BASE_NODE_PORT + nodeId}/message`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(message),
+  });
+}
+
+function getMostCommonValue(xs: Value[]): Value | null {
+  const xCounts = [0, 0];
+  for (const x of xs) {
+    if(x !== '?') {
+      xCounts[x]++;
+    }
+  }
+
+  if (xCounts[0] > xCounts[1]) {
+    return 0;
+  } else if (xCounts[1] > xCounts[0]) {
+    return 1;
+  } else {
+    return null;
+  }
+}
+
+function getVoteCounts(votes: Value[]): [number, number] {
+  const voteCounts = [0, 0];
+  for (const vote of votes) {
+    if(vote !== '?') {
+      voteCounts[vote]++;
+    }
+  }
+  return [voteCounts[0], voteCounts[1]];
 }
